@@ -286,7 +286,9 @@ Return only JSON with this shape:
         IReadOnlyList<ConversationMessage> history,
         CancellationToken cancellationToken)
     {
-        var apiKey = Required(config, "OPENAI_API_KEY");
+        var apiKey = config["OPENAI_API_KEY"];
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException("Required setting OPENAI_API_KEY is missing.");
         var model = config["OPENAI_MODEL"] ?? "gpt-5-mini";
         var transcript = string.Join("\n", history.TakeLast(20).Select(m => $"{m.Role}: {m.Text}"));
 
@@ -325,13 +327,24 @@ Return only JSON with this shape:
         response.EnsureSuccessStatusCode();
 
         using var document = JsonDocument.Parse(body);
-        var outputText = document.RootElement.GetProperty("output")
-            .EnumerateArray()
-            .SelectMany(o => o.TryGetProperty("content", out var c) ? c.EnumerateArray() : [])
-            .Where(c => c.TryGetProperty("type", out var t) && t.GetString() == "output_text")
-            .Select(c => c.GetProperty("text").GetString())
-            .FirstOrDefault(t => !string.IsNullOrWhiteSpace(t))
-            ?? throw new InvalidOperationException("OpenAI returned no output text.");
+        string? outputText = null;
+        foreach (var outputItem in document.RootElement.GetProperty("output").EnumerateArray())
+        {
+            if (!outputItem.TryGetProperty("content", out var contentItems)) continue;
+            foreach (var contentItem in contentItems.EnumerateArray())
+            {
+                if (contentItem.TryGetProperty("type", out var type) &&
+                    type.GetString() == "output_text")
+                {
+                    outputText = contentItem.GetProperty("text").GetString();
+                    if (!string.IsNullOrWhiteSpace(outputText)) break;
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(outputText)) break;
+        }
+
+        if (string.IsNullOrWhiteSpace(outputText))
+            throw new InvalidOperationException("OpenAI returned no output text.");
 
         return JsonSerializer.Deserialize<AgentAnswer>(
                    outputText,
