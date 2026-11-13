@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -8,9 +7,37 @@ using System.Xml.Linq;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient<OpenAiConversationService>();
 builder.Services.AddSingleton<LeadStore>();
+builder.Services.AddHttpClient<PilotIntegrations>(client => client.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddHostedService<SalesAlerts>();
 
 var app = builder.Build();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
+
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/twilio"))
+    {
+        if (!await PilotSecurity.ValidTwilioRequestAsync(context))
+        {
+            context.Response.StatusCode = 403;
+            return;
+        }
+    }
+    else if (context.Request.Path.StartsWithSegments("/sales") ||
+             context.Request.Path.StartsWithSegments("/api") ||
+             context.Request.Path.StartsWithSegments("/test"))
+    {
+        if (!PilotSecurity.ValidStaffRequest(context))
+        {
+            context.Response.Headers.WWWAuthenticate = "Basic realm=\"MIS Sales\"";
+            context.Response.StatusCode = 401;
+            return;
+        }
+    }
+    await next(context);
+});
+
+app.MapSalesEndpoints();
 
 app.MapGet("/", () => Results.Ok(new
 {
@@ -49,10 +76,10 @@ app.MapPost("/twilio/handoff", async (HttpRequest request, IConfiguration config
 {
     var form = await request.ReadFormAsync();
     var handoffData = form["HandoffData"].ToString();
-    var transferNumber = config["TRANSFER_NUMBER"] ?? "+16093674818";
+    var transferNumber = config["TRANSFER_NUMBER"];
     var shouldTransfer = handoffData.Contains("live-agent-handoff", StringComparison.OrdinalIgnoreCase);
 
-    var response = shouldTransfer
+    var response = shouldTransfer && !string.IsNullOrWhiteSpace(transferNumber)
         ? new XElement("Response",
             new XElement("Say", "Please hold while I connect you."),
             new XElement("Dial",
@@ -70,6 +97,7 @@ app.Map("/twilio/conversation", async (
     IConfiguration config,
     OpenAiConversationService ai,
     LeadStore leads,
+    PilotIntegrations integrations,
     ILoggerFactory loggerFactory) =>
 {
     var logger = loggerFactory.CreateLogger("ConversationRelay");
@@ -81,7 +109,7 @@ app.Map("/twilio/conversation", async (
     }
 
     var expectedSecret = Required(config, "RELAY_SHARED_SECRET");
-    if (!ConstantTimeEquals(context.Request.Query["key"], expectedSecret))
+    if (!ConstantTimeEquals(context.Request.Query["key"].ToString(), expectedSecret))
     {
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         return;
@@ -91,75 +119,90 @@ app.Map("/twilio/conversation", async (
     var session = new CallSession();
     logger.LogInformation("ConversationRelay connection opened");
 
-    while (socket.State == WebSocketState.Open)
+    try
     {
-        var message = await ReceiveTextAsync(socket, context.RequestAborted);
-        if (message is null) break;
-
-        using var document = JsonDocument.Parse(message);
-        var root = document.RootElement;
-        var type = root.GetProperty("type").GetString();
-
-        if (type == "setup")
+        while (socket.State == WebSocketState.Open)
         {
-            session.CallSid = GetString(root, "callSid");
-            session.CallerNumber = GetString(root, "from");
-            continue;
-        }
+            var message = await ReceiveTextAsync(socket, context.RequestAborted);
+            if (message is null) break;
 
-        if (type != "prompt" ||
-            !root.TryGetProperty("last", out var last) ||
-            !last.GetBoolean())
-        {
-            continue;
-        }
+            using var document = JsonDocument.Parse(message);
+            var root = document.RootElement;
+            var type = root.GetProperty("type").GetString();
 
-        var callerText = GetString(root, "voicePrompt");
-        if (string.IsNullOrWhiteSpace(callerText)) continue;
-
-        session.Messages.Add(new ConversationMessage("caller", callerText));
-
-        if (TransferRules.RequestsHuman(callerText))
-        {
-            await SendTextAsync(socket,
-                "Certainly. I will connect you with someone at Micro Integration Services now.",
-                true,
-                context.RequestAborted);
-            await Task.Delay(1400, context.RequestAborted);
-            await SendEndAsync(socket, context.RequestAborted);
-            break;
-        }
-
-        try
-        {
-            var answer = await ai.RespondAsync(session.Messages, context.RequestAborted);
-            session.Messages.Add(new ConversationMessage("assistant", answer.Text));
-
-            await SendTextAsync(socket, answer.Text, true, context.RequestAborted);
-
-            if (answer.TransferToHuman)
+            if (type == "setup")
             {
+                session.CallSid = GetString(root, "callSid");
+                session.CallerNumber = GetString(root, "from");
+                continue;
+            }
+
+            if (type != "prompt" ||
+                !root.TryGetProperty("last", out var last) ||
+                !last.GetBoolean())
+            {
+                continue;
+            }
+
+            var callerText = GetString(root, "voicePrompt");
+            if (string.IsNullOrWhiteSpace(callerText)) continue;
+
+            session.Messages.Add(new ConversationMessage("caller", callerText));
+
+            if (TransferRules.RequestsHuman(callerText))
+            {
+                await SendTextAsync(socket,
+                    "Certainly. I will connect you with someone at Micro Integration Services now.",
+                    true,
+                    context.RequestAborted);
+                await Task.Delay(1400, context.RequestAborted);
+                await SendEndAsync(socket, context.RequestAborted);
+                break;
+            }
+
+            try
+            {
+                var answer = await ai.RespondAsync(session.Messages, context.RequestAborted, session.BookingContext);
+                if (!answer.TransferToHuman)
+                {
+                    answer = await BookingFlow.ApplyAsync(session, answer, integrations, leads, context.RequestAborted);
+                    leads.Save(LeadSummary.FromSession(session));
+                }
+                session.Messages.Add(new ConversationMessage("assistant", answer.Text));
+
+                await SendTextAsync(socket, answer.Text, true, context.RequestAborted);
+
+                if (answer.TransferToHuman)
+                {
+                    await Task.Delay(1400, context.RequestAborted);
+                    await SendEndAsync(socket, context.RequestAborted);
+                    break;
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Unable to produce AI response for call {CallSid}", session.CallSid);
+                await SendTextAsync(socket,
+                    "I am sorry, I am having trouble accessing that information. I will connect you with someone who can help.",
+                    true,
+                    context.RequestAborted);
                 await Task.Delay(1400, context.RequestAborted);
                 await SendEndAsync(socket, context.RequestAborted);
                 break;
             }
         }
-        catch (Exception ex)
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { }
+    catch (WebSocketException) { }
+    finally
+    {
+        if (session.Messages.Count > 0)
         {
-            logger.LogError(ex, "Unable to produce AI response for call {CallSid}", session.CallSid);
-            await SendTextAsync(socket,
-                "I am sorry, I am having trouble accessing that information. I will connect you with someone who can help.",
-                true,
-                context.RequestAborted);
-            await Task.Delay(1400, context.RequestAborted);
-            await SendEndAsync(socket, context.RequestAborted);
-            break;
+            var lead = LeadSummary.FromSession(session);
+            leads.Save(lead, completed: true);
+            logger.LogInformation("Call {CallSid} completed with outcome {Outcome}", lead.CallSid, lead.Outcome);
         }
     }
-
-    var lead = LeadSummary.FromSession(session);
-    leads.Save(lead);
-    logger.LogInformation("Call {CallSid} completed with lead score {Score}", lead.CallSid, lead.Score);
 });
 
 app.MapGet("/api/leads", (LeadStore leads) => Results.Ok(leads.All()));
@@ -207,6 +250,7 @@ static async Task<string?> ReceiveTextAsync(WebSocket socket, CancellationToken 
     {
         var result = await socket.ReceiveAsync(buffer, cancellationToken);
         if (result.MessageType == WebSocketMessageType.Close) return null;
+        if (stream.Length + result.Count > 65536) throw new WebSocketException("Relay message too large.");
         stream.Write(buffer, 0, result.Count);
         if (result.EndOfMessage) break;
     }
@@ -278,13 +322,20 @@ Conversation rules:
   or asks for something outside approved facts, set transferToHuman to true.
 - Keep spoken answers normally below 70 words.
 
-Return only JSON with this shape:
-{"text":"spoken response","transferToHuman":false}
+Extract project details from what the caller actually said. Use empty strings for unknowns.
+Set projectFit only for a concrete business software project within MIS services.
+Set meetingRequested only when the caller explicitly asks for or accepts a discovery call.
+Use selectedSlot 1 or 2 only when the caller explicitly picks a currently offered slot. Otherwise use 0.
+Set smsConsent only when the caller explicitly agrees to a meeting confirmation text or asks you to text it.
+Give a concise next response. If a qualified caller wants a meeting, collect their company, name, and email.
+The application offers verified slots and confirms actual bookings. Never claim to have booked or sent a text.
+Use IANA time zone names only if stated or unambiguously inferable. Otherwise leave it empty.
 """;
 
     public async Task<AgentAnswer> RespondAsync(
         IReadOnlyList<ConversationMessage> history,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string bookingContext = "")
     {
         var apiKey = config["OPENAI_API_KEY"];
         if (string.IsNullOrWhiteSpace(apiKey))
@@ -298,7 +349,7 @@ Return only JSON with this shape:
         request.Content = JsonContent.Create(new
         {
             model,
-            instructions = Instructions,
+            instructions = Instructions + "\nCurrent appointment state: " + bookingContext,
             input = transcript,
             text = new
             {
@@ -313,9 +364,19 @@ Return only JSON with this shape:
                         properties = new
                         {
                             text = new { type = "string" },
-                            transferToHuman = new { type = "boolean" }
+                            transferToHuman = new { type = "boolean" },
+                            name = new { type = "string" },
+                            company = new { type = "string" },
+                            email = new { type = "string" },
+                            project = new { type = "string" },
+                            timing = new { type = "string" },
+                            timeZone = new { type = "string" },
+                            projectFit = new { type = "boolean" },
+                            meetingRequested = new { type = "boolean" },
+                            selectedSlot = new { type = "integer" },
+                            smsConsent = new { type = "boolean" }
                         },
-                        required = new[] { "text", "transferToHuman" },
+                        required = new[] { "text", "transferToHuman", "name", "company", "email", "project", "timing", "timeZone", "projectFit", "meetingRequested", "selectedSlot", "smsConsent" },
                         additionalProperties = false
                     }
                 }
@@ -366,21 +427,19 @@ public static class TransferRules
         HumanPhrases.Any(p => text.Contains(p, StringComparison.OrdinalIgnoreCase));
 }
 
-public sealed class LeadStore
-{
-    private readonly ConcurrentDictionary<string, QualifiedLead> _leads = new();
-
-    public void Save(QualifiedLead lead) => _leads[lead.CallSid] = lead;
-
-    public IReadOnlyCollection<QualifiedLead> All() =>
-        _leads.Values.OrderByDescending(l => l.CompletedAtUtc).ToArray();
-}
-
 public sealed class CallSession
 {
     public string CallSid { get; set; } = Guid.NewGuid().ToString("N");
     public string CallerNumber { get; set; } = "";
     public List<ConversationMessage> Messages { get; } = [];
+    public AgentAnswer? Intake { get; set; }
+    public DateTimeOffset[] Slots { get; set; } = [];
+    public DateTimeOffset? BookedTime { get; set; }
+    public string? BookingId { get; set; }
+    public bool BookingNeedsReview { get; set; }
+    public bool ConfirmationAttempted { get; set; }
+    public bool AskedForSmsConsent { get; set; }
+    public string BookingContext => BookingFlow.Context(this);
 }
 
 public sealed record ConversationMessage(
@@ -389,20 +448,25 @@ public sealed record ConversationMessage(
 
 public sealed record AgentAnswer(
     [property: JsonPropertyName("text")] string Text,
-    [property: JsonPropertyName("transferToHuman")] bool TransferToHuman);
+    [property: JsonPropertyName("transferToHuman")] bool TransferToHuman,
+    string Name = "", string Company = "", string Email = "", string Project = "",
+    string Timing = "", string TimeZone = "", bool ProjectFit = false,
+    bool MeetingRequested = false, int SelectedSlot = 0, bool SmsConsent = false);
 
 public sealed record QualifiedLead(
     string CallSid,
     string CallerNumber,
     int Score,
     string Transcript,
-    DateTimeOffset CompletedAtUtc);
+    DateTimeOffset CompletedAtUtc,
+    string Name, string Company, string Email, string Project, string Timing,
+    string Outcome, DateTimeOffset? BookedTime, string? BookingId);
 
 public static class LeadSummary
 {
     public static QualifiedLead FromSession(CallSession session)
     {
-        var transcript = string.Join("\n", session.Messages.Select(m => $"{m.Role}: {m.Text}"));
+        var transcript = string.Join("\n", session.Messages.Where(m => m.Role == "caller").Select(m => $"{m.Role}: {m.Text}"));
         var score = 0;
         if (session.Messages.Count >= 4) score += 10;
         if (ContainsAny(transcript, "legacy", "FoxPro", "VB6", "Access", "old application")) score += 25;
@@ -416,7 +480,12 @@ public static class LeadSummary
             session.CallerNumber,
             Math.Min(score, 100),
             transcript,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            session.Intake?.Name ?? "", session.Intake?.Company ?? "", session.Intake?.Email ?? "",
+            session.Intake?.Project ?? "", session.Intake?.Timing ?? "",
+            session.BookedTime is not null ? "Meeting booked" :
+            session.Intake is { ProjectFit: true, MeetingRequested: true } ? "Meeting requested" : "Intake",
+            session.BookedTime, session.BookingId);
     }
 
     private static bool ContainsAny(string text, params string[] terms) =>
