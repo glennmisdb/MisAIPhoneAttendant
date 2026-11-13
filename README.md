@@ -1,110 +1,41 @@
 # MIS AI Phone Attendant
 
-A .NET 9 pilot that connects a new Twilio test number to Twilio ConversationRelay. It uses OpenAI to answer basic questions about Micro Integration Services, qualify prospective leads, and transfer callers to a person.
+This ASP.NET Core pilot answers a dedicated Google Ads number, screens business-software inquiries, and offers qualified callers a discovery appointment while they are still on the line. Twilio Conversation Relay handles speech and OpenAI helps with the conversation and intake. The application owns appointment execution and sales follow-up.
 
-The pilot transfer destination is `+16093674818`.
+## Setup
 
-## Responsibilities
-
-Twilio supplies the phone number, answers the PSTN call, transcribes caller speech, speaks the application's response, and performs the final phone transfer. This application owns MIS knowledge, conversation rules, lead qualification, AI requests, lead summaries, and the transfer decision.
-
-## Features
-
-- Natural inbound voice conversation through Twilio ConversationRelay
-- Explicit disclosure that the attendant is automated AI
-- Restricted MIS knowledge and safety instructions
-- Immediate transfer when a caller requests a person or reports an emergency
-- Transfer handoff to the configured telephone number
-- In-memory lead summaries and scoring
-- Browser conversation simulator at `/test`
-- Health endpoint at `/health`
-- No call recording
-- Docker support and GitHub Actions build validation
-
-## Prerequisites
-
-- .NET 9 SDK
-- An OpenAI API key
-- A Twilio account with ConversationRelay access
-- A new voice-capable Twilio test number
-- A public HTTPS host that supports secure WebSockets
-
-## Configuration
-
-Set these environment variables. Never commit their actual values.
-
-| Variable | Purpose |
-| --- | --- |
-| `OPENAI_API_KEY` | OpenAI API credential |
-| `OPENAI_MODEL` | Model name; defaults to `gpt-5-mini` |
-| `PUBLIC_BASE_URL` | Public HTTPS URL without a trailing slash |
-| `RELAY_SHARED_SECRET` | Long random value protecting the WebSocket endpoint |
-| `TRANSFER_NUMBER` | Human transfer destination; pilot value is `+16093674818` |
-| `LEAD_NOTIFICATION_EMAIL` | Reserved for the email-notification phase |
-
-Copy `.env.example` as a reference. ASP.NET Core reads operating-system environment variables automatically.
-
-## Run locally
+Run the application with the .NET 9 SDK or the included Dockerfile.
 
 ```bash
-dotnet run --project src/MisAIPhoneAttendant/MisAIPhoneAttendant.csproj
+dotnet run --project src/MisAIPhoneAttendant
 ```
 
-For local telephone testing, expose the application through a secure tunnel that supports WebSockets and set `PUBLIC_BASE_URL` to that HTTPS address. For example:
+Use [.env.example](.env.example) as a reference for environment variables. Set credentials through the host's secret configuration. ASP.NET Core does not load the example file.
 
-```text
-PUBLIC_BASE_URL=https://example-tunnel-host
-```
+| Settings | Purpose |
+| --- | --- |
+| `PUBLIC_BASE_URL`, `RELAY_SHARED_SECRET` | Public HTTPS origin with WebSocket support and a random relay secret |
+| `TWILIO_AUTH_TOKEN`, `TWILIO_ACCOUNT_SID`, `TWILIO_NUMBER` | Signed Twilio requests and sending SMS from the dedicated E.164 number |
+| `OPENAI_API_KEY`, `OPENAI_MODEL` | Conversational intake model |
+| `CALENDLY_TOKEN`, `CALENDLY_EVENT_TYPE` | Calendly API token and full API URI for the event type |
+| `SALES_USER`, `SALES_PASSWORD` | Staff access to the lead and SMS inbox and browser simulator. Use a strong password and serve over HTTPS. |
+| `SALES_EMAIL`, `SMTP_*` | Sales distribution address and SMTP relay settings. Use a relay that accepts the configured SMTP authentication method. |
+| `TRANSFER_NUMBER` | E.164 number for callers asking for a person. Set this before testing transfers. |
+| `SALES_DATA_PATH` | Writable path for lead, SMS and sales-alert data. Mount a persistent volume for Docker and use a single app instance. |
 
-Open `http://localhost:5000/test` or the URL printed by `dotnet run` to test the conversation without Twilio.
+Create a 20-minute Calendly event type with availability reserved for discovery calls. Use an event type with only the standard name and email fields. For the pilot, the agent uses Eastern time when the caller's time zone is unknown.
 
-## Configure the Twilio test number
+Set the Twilio number's incoming voice webhook to `POST /twilio/incoming-call` and its incoming messaging webhook to `POST /twilio/sms`, both on the configured public HTTPS origin. Keep `/twilio/conversation` available for the WebSocket upgrade. Complete messaging registration for your number and enable Twilio opt-out handling before sending texts.
 
-1. Purchase a new voice-capable Twilio number.
-2. Open the number's voice configuration.
-3. For **A call comes in**, select **Webhook**.
-4. Set the webhook to:
-   ```text
-   https://YOUR-PUBLIC-HOST/twilio/incoming-call
-   ```
-5. Select HTTP `POST`.
-6. Save the configuration.
-7. Call the new number.
+## Staff workflow
 
-The incoming-call endpoint returns TwiML that connects Twilio to:
+- Open `/sales` for the lead list and two-way SMS inbox.
+- Sales gets a **Meeting booked** email when Calendly accepts an appointment. If a qualified caller asks for a meeting and the call ends without a confirmed booking, sales gets a **Meeting requested** email. If a booking response is uncertain, check Calendly before rebooking.
+- After booking, the voice agent asks permission to text a confirmation. Staff can respond to texts in the inbox.
+- Use `/test` for AI conversation testing, `/api/leads` for the authenticated lead feed, and `/health` for a liveness check.
 
-```text
-wss://YOUR-PUBLIC-HOST/twilio/conversation
-```
+## Before routing Google Ads traffic
 
-When a transfer is required, the application sends ConversationRelay an `end` message with handoff data. Twilio posts that data to `/twilio/handoff`, which responds with TwiML that dials `+16093674818`.
+On the dedicated test number, place a qualified call that books a meeting, a qualified call that asks for follow-up without booking, and a call that does not qualify. Confirm Calendly creates a single appointment and sends the invitation. Check both sales alerts, reply to the confirmation SMS, and send a reply from the staff inbox. Test a rejected calendar request and a human transfer.
 
-## Endpoints
-
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| `POST` | `/twilio/incoming-call` | Returns ConversationRelay TwiML |
-| `GET` WebSocket | `/twilio/conversation` | Exchanges caller prompts and AI responses |
-| `POST` | `/twilio/handoff` | Transfers or closes the call |
-| `GET` | `/api/leads` | Displays pilot in-memory lead summaries |
-| `GET` | `/test` | Browser conversation simulator |
-| `POST` | `/test/conversation` | Simulator AI endpoint |
-| `GET` | `/health` | Health check |
-
-## Production hardening
-
-This is a pilot, not a finished production receptionist. Before using the published MIS number:
-
-- Replace in-memory lead storage with SQL Server.
-- Authenticate and restrict the lead API.
-- Add Twilio signature validation in addition to the relay shared secret.
-- Add persistent suppression and retention rules.
-- Implement email or CRM notifications.
-- Rate-limit public endpoints.
-- Add monitoring, structured audit events, and alerting.
-- Run scripted call evaluations for incorrect answers and missed transfers.
-- Review disclosure, transcription, and retention language with counsel.
-
-## Cost boundary
-
-Twilio ConversationRelay performs speech recognition and text-to-speech. OpenAI receives text, not the telephone audio, in this architecture. The application does not record calls.
+The pilot uses a single-instance JSON file store and retains caller text in the protected lead API. Deploy with persistent storage and restricted access. Configure a retention policy for pilot data. For a multi-instance deployment, move the store and alert queue to a shared transactional database. SMTP retry can resend an alert if the application stops after the relay accepts it but before the send is recorded.
