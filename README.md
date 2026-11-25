@@ -14,6 +14,7 @@ Twilio supplies the phone number, answers the PSTN call, transcribes caller spee
 - Explicit disclosure that the attendant is automated AI
 - Restricted MIS knowledge and safety instructions
 - Immediate transfer when a caller requests a person or reports an emergency
+- Before ending a conversation, offer to connect the caller to an MIS representative; wait for their reply
 - Transfer handoff to the configured telephone number
 - In-memory lead summaries and scoring
 - Browser conversation simulator at `/test`
@@ -78,6 +79,14 @@ wss://YOUR-PUBLIC-HOST/twilio/conversation
 ```
 
 When a transfer is required, the application sends ConversationRelay an `end` message with handoff data. Twilio posts that data to `/twilio/handoff`, which responds with TwiML that dials `+16093674818`.
+
+## Spoken callback numbers and silence recovery
+
+The attendant reads back a recognized US-style 10-digit callback number (or 11 digits starting with 1) and asks the caller to confirm or correct it. After confirmation it offers a live transfer. Other questions can continue the conversation. If no relay input arrives for 25 seconds, the attendant repeats its last prompt; continued silence leads to a transfer offer and then a farewell. AI requests have an eight-second deadline, and failures lead to a spoken transfer offer. Logs include relay event types and response timing, not the spoken number itself.
+
+## Closing conversation
+
+When the caller indicates they are finished, the attendant asks whether they would like to speak with an MIS representative. A yes transfers the caller; a no plays the final farewell and disconnects. A new question continues the conversation. The same logic is available in the browser simulator.
 
 ## Endpoints
 
