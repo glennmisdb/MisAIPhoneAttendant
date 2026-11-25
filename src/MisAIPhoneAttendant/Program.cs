@@ -91,14 +91,44 @@ app.Map("/twilio/conversation", async (
     var session = new CallSession();
     logger.LogInformation("ConversationRelay connection opened");
 
+    Task<string?>? pendingReceive = null;
+    var silenceRetries = 0;
     while (socket.State == WebSocketState.Open)
     {
-        var message = await ReceiveTextAsync(socket, context.RequestAborted);
+        pendingReceive ??= ReceiveTextAsync(socket, context.RequestAborted);
+        string? message;
+        try
+        {
+            // Keep the same outstanding receive; cancelling it could abort the WebSocket.
+            message = await pendingReceive.WaitAsync(TimeSpan.FromSeconds(25), context.RequestAborted);
+            pendingReceive = null;
+        }
+        catch (TimeoutException)
+        {
+            logger.LogWarning("No relay input for call {CallSid}; retry {Retry}", session.CallSid, silenceRetries);
+            var previous = session.Messages.LastOrDefault(m => m.Role == "assistant")?.Text;
+            if (silenceRetries++ == 0)
+            {
+                await SendTextAsync(socket, "Are you still there? " + (previous ?? "How may I help you?"), true, context.RequestAborted);
+            }
+            else if (previous?.EndsWith(ClosingRules.OfferText, StringComparison.Ordinal) != true)
+            {
+                session.Messages.Add(new ConversationMessage("assistant", ClosingRules.OfferText));
+                await SendTextAsync(socket, ClosingRules.OfferText, true, context.RequestAborted);
+            }
+            else
+            {
+                await SendEndAsync(socket, false, context.RequestAborted);
+                break;
+            }
+            continue;
+        }
         if (message is null) break;
 
         using var document = JsonDocument.Parse(message);
         var root = document.RootElement;
-        var type = root.GetProperty("type").GetString();
+        var type = GetString(root, "type");
+        logger.LogDebug("Relay event {EventType} for call {CallSid}", type, session.CallSid);
 
         if (type == "setup")
         {
@@ -115,13 +145,21 @@ app.Map("/twilio/conversation", async (
         }
 
         var callerText = GetString(root, "voicePrompt");
-        if (string.IsNullOrWhiteSpace(callerText)) continue;
+        if (string.IsNullOrWhiteSpace(callerText))
+        {
+            logger.LogWarning("Empty final speech prompt for call {CallSid}", session.CallSid);
+            await SendTextAsync(socket, "I'm sorry, I didn't catch that. Please repeat your answer.", true, context.RequestAborted);
+            continue;
+        }
+        silenceRetries = 0;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
 
         session.Messages.Add(new ConversationMessage("caller", callerText));
 
         try
         {
             var answer = await ai.RespondAsync(session.Messages, context.RequestAborted);
+            logger.LogInformation("Response ready for call {CallSid} in {ElapsedMs} ms", session.CallSid, timer.ElapsedMilliseconds);
             session.Messages.Add(new ConversationMessage("assistant", answer.Text));
 
             if (answer.EndCall)
@@ -143,13 +181,8 @@ app.Map("/twilio/conversation", async (
         catch (Exception ex)
         {
             logger.LogError(ex, "Unable to produce AI response for call {CallSid}", session.CallSid);
-            await SendTextAsync(socket,
-                "I am sorry, I am having trouble accessing that information. I will connect you with someone who can help.",
-                true,
-                context.RequestAborted);
-            await Task.Delay(1400, context.RequestAborted);
-            await SendEndAsync(socket, true, context.RequestAborted);
-            break;
+            session.Messages.Add(new ConversationMessage("assistant", ClosingRules.OfferText));
+            await SendTextAsync(socket, ClosingRules.OfferText, true, context.RequestAborted);
         }
     }
 
@@ -172,8 +205,14 @@ app.MapPost("/test/conversation", async (
         .TakeLast(20)
         .ToList();
 
-    var answer = await ai.RespondAsync(messages, cancellationToken);
-    return Results.Ok(answer);
+    try
+    {
+        return Results.Ok(await ai.RespondAsync(messages, cancellationToken));
+    }
+    catch (Exception) when (!cancellationToken.IsCancellationRequested)
+    {
+        return Results.Ok(ClosingRules.Offer);
+    }
 });
 
 app.Run();
@@ -273,6 +312,11 @@ Conversation rules:
 - If the caller requests a human, reports an existing-client production emergency, becomes frustrated,
   or asks for something outside approved facts, set transferToHuman to true.
 - Keep spoken answers normally below 70 words.
+- When asking for a callback number, explicitly say "callback number" or "phone number".
+- The application reads back recognized numbers for confirmation. After confirmation,
+  acknowledge it, continue with any remaining essential information, or set offerClosing
+  to true if collection is complete. Never respond with empty text.
+- Do not ask for the callback number again if it has already been confirmed.
 - When the caller indicates they are finished, or you would otherwise say goodbye, set
   offerClosing to true. Do not say goodbye or end the call yet.
 - If the previous assistant message offered to connect the caller, interpret
@@ -303,6 +347,11 @@ Return only JSON with this shape:
         if (!closingPending && ClosingRules.IsGoodbye(callerText))
             return ClosingRules.Offer;
 
+        var phoneAnswer = CallbackRules.Handle(history);
+        if (phoneAnswer is not null) return phoneAnswer;
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(8));
         var apiKey = config["OPENAI_API_KEY"];
         if (string.IsNullOrWhiteSpace(apiKey))
             throw new InvalidOperationException("Required setting OPENAI_API_KEY is missing.");
@@ -341,8 +390,8 @@ Return only JSON with this shape:
             }
         });
 
-        using var response = await httpClient.SendAsync(request, cancellationToken);
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        using var response = await httpClient.SendAsync(request, deadline.Token);
+        var body = await response.Content.ReadAsStringAsync(deadline.Token);
         response.EnsureSuccessStatusCode();
 
         using var document = JsonDocument.Parse(body);
@@ -372,7 +421,55 @@ Return only JSON with this shape:
         if (answer.TransferToHuman) return ClosingRules.Transfer;
         if (answer.EndCall) return closingPending ? ClosingRules.Farewell : ClosingRules.Offer;
         if (answer.OfferClosing || ClosingRules.IsGoodbye(answer.Text)) return ClosingRules.Offer;
+        if (string.IsNullOrWhiteSpace(answer.Text))
+            throw new InvalidOperationException("OpenAI returned empty spoken text.");
         return answer;
+    }
+}
+
+public static class CallbackRules
+{
+    private const string Prefix = "I heard your callback number as ";
+    private const string Retry = "Please repeat your callback number, one digit at a time.";
+    public static AgentAnswer? Handle(IReadOnlyList<ConversationMessage> history)
+    {
+        if (history.Count < 2 || history[^2].Role != "assistant") return null;
+        var previous = history[^2].Text;
+        var caller = history[^1].Text.Trim();
+        var confirmation = previous.StartsWith(Prefix, StringComparison.Ordinal);
+        var asking = previous.Contains("callback number", StringComparison.OrdinalIgnoreCase) ||
+                     previous.Contains("phone number", StringComparison.OrdinalIgnoreCase) ||
+                     previous.Contains("telephone number", StringComparison.OrdinalIgnoreCase);
+        if (!asking) return null;
+        if (confirmation && (ClosingRules.IsAcceptance(caller) ||
+            caller.TrimEnd('.', '!').ToLowerInvariant() is "correct" or "that is correct" or "that's correct" or "yes that's right" or "yes, that's right"))
+            return new AgentAnswer("Thank you for confirming your number. " + ClosingRules.OfferText, false, true);
+        var digits = Parse(caller);
+        if (digits is not null)
+            return new AgentAnswer(Prefix + string.Join(", ", digits.Select(c => c.ToString())) + ". Is that correct?", false);
+        if (confirmation && ClosingRules.IsDecline(caller))
+            return new AgentAnswer(Retry, false);
+        if (caller.Any(char.IsDigit) || caller.Split(' ').Any(w => Words.ContainsKey(w.ToLowerInvariant())))
+            return new AgentAnswer(Retry, false);
+        return null;
+    }
+
+    private static readonly Dictionary<string, string> Words = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["zero"]="0", ["oh"]="0", ["one"]="1", ["two"]="2", ["three"]="3", ["four"]="4",
+        ["five"]="5", ["six"]="6", ["seven"]="7", ["eight"]="8", ["nine"]="9"
+    };
+
+    public static string? Parse(string text)
+    {
+        var digits = new StringBuilder();
+        foreach (System.Text.RegularExpressions.Match match in
+                 System.Text.RegularExpressions.Regex.Matches(text, @"[0-9]+|[a-zA-Z]+"))
+        {
+            if (Words.TryGetValue(match.Value, out var digit)) digits.Append(digit);
+            else if (match.Value.All(char.IsDigit)) digits.Append(match.Value);
+        }
+        return digits.Length == 10 || (digits.Length == 11 && digits[0] == '1') ? digits.ToString() : null;
     }
 }
 
@@ -401,7 +498,7 @@ public static class ClosingRules
         "Thank you for calling Micro Integration Services. We appreciate your interest and look forward to helping you. Have a wonderful day!", false, false, true);
 
     public static bool IsPending(IReadOnlyList<ConversationMessage> history) =>
-        history.Count >= 2 && history[^2].Role == "assistant" && history[^2].Text == OfferText;
+        history.Count >= 2 && history[^2].Role == "assistant" && history[^2].Text.EndsWith(OfferText, StringComparison.Ordinal);
 
     private static string Normalize(string text) =>
         text.Trim().TrimEnd('.', '!', '?', ',').ToLowerInvariant().Replace("’", "'");
