@@ -59,7 +59,7 @@ app.MapPost("/twilio/handoff", async (HttpRequest request, IConfiguration config
                 new XAttribute("answerOnBridge", "true"),
                 transferNumber))
         : new XElement("Response",
-            new XElement("Say", "Thank you for calling Micro Integration Services. Goodbye."),
+            new XElement("Say", "Thank you for calling Micro Integration Services. We appreciate your interest and look forward to helping you. Have a wonderful day!"),
             new XElement("Hangup"));
 
     return Results.Text(response.ToString(SaveOptions.DisableFormatting), "application/xml");
@@ -119,28 +119,24 @@ app.Map("/twilio/conversation", async (
 
         session.Messages.Add(new ConversationMessage("caller", callerText));
 
-        if (TransferRules.RequestsHuman(callerText))
-        {
-            await SendTextAsync(socket,
-                "Certainly. I will connect you with someone at Micro Integration Services now.",
-                true,
-                context.RequestAborted);
-            await Task.Delay(1400, context.RequestAborted);
-            await SendEndAsync(socket, context.RequestAborted);
-            break;
-        }
-
         try
         {
             var answer = await ai.RespondAsync(session.Messages, context.RequestAborted);
             session.Messages.Add(new ConversationMessage("assistant", answer.Text));
+
+            if (answer.EndCall)
+            {
+                // The handoff webhook speaks the final farewell before hanging up.
+                await SendEndAsync(socket, false, context.RequestAborted);
+                break;
+            }
 
             await SendTextAsync(socket, answer.Text, true, context.RequestAborted);
 
             if (answer.TransferToHuman)
             {
                 await Task.Delay(1400, context.RequestAborted);
-                await SendEndAsync(socket, context.RequestAborted);
+                await SendEndAsync(socket, true, context.RequestAborted);
                 break;
             }
         }
@@ -152,7 +148,7 @@ app.Map("/twilio/conversation", async (
                 true,
                 context.RequestAborted);
             await Task.Delay(1400, context.RequestAborted);
-            await SendEndAsync(socket, context.RequestAborted);
+            await SendEndAsync(socket, true, context.RequestAborted);
             break;
         }
     }
@@ -235,12 +231,12 @@ static Task SendTextAsync(
         cancellationToken);
 }
 
-static Task SendEndAsync(WebSocket socket, CancellationToken cancellationToken)
+static Task SendEndAsync(WebSocket socket, bool transfer, CancellationToken cancellationToken)
 {
     var handoff = JsonSerializer.Serialize(new
     {
-        reasonCode = "live-agent-handoff",
-        reason = "Caller requested or requires a person"
+        reasonCode = transfer ? "live-agent-handoff" : "caller-confirmed-goodbye",
+        reason = transfer ? "Caller requested or requires a person" : "Caller declined further assistance"
     });
     var json = JsonSerializer.Serialize(new { type = "end", handoffData = handoff });
     return socket.SendAsync(
@@ -277,15 +273,36 @@ Conversation rules:
 - If the caller requests a human, reports an existing-client production emergency, becomes frustrated,
   or asks for something outside approved facts, set transferToHuman to true.
 - Keep spoken answers normally below 70 words.
+- When the caller indicates they are finished, or you would otherwise say goodbye, set
+  offerClosing to true. Do not say goodbye or end the call yet.
+- If the previous assistant message offered to connect the caller, interpret
+  the next caller response in that context. If they accept a transfer, set transferToHuman
+  to true. If they clearly decline further assistance, set endCall to true.
+- If they ask another question, answer it and continue normally. If their intention is ambiguous,
+  clarify whether they want to speak with a representative.
+- Never transfer merely because the caller mentions a representative in a negative response.
+- Set endCall only after the caller has had the closing offer and clearly declined it.
+- Do not include a final farewell in normal spoken responses.
 
 Return only JSON with this shape:
-{"text":"spoken response","transferToHuman":false}
+{"text":"spoken response","transferToHuman":false,"offerClosing":false,"endCall":false}
 """;
 
     public async Task<AgentAnswer> RespondAsync(
         IReadOnlyList<ConversationMessage> history,
         CancellationToken cancellationToken)
     {
+        var closingPending = ClosingRules.IsPending(history);
+        var callerText = history.LastOrDefault()?.Text ?? "";
+        if (!closingPending && TransferRules.RequestsHuman(callerText))
+            return ClosingRules.Transfer;
+        if (closingPending && ClosingRules.IsDecline(callerText))
+            return ClosingRules.Farewell;
+        if (closingPending && ClosingRules.IsAcceptance(callerText))
+            return ClosingRules.Transfer;
+        if (!closingPending && ClosingRules.IsGoodbye(callerText))
+            return ClosingRules.Offer;
+
         var apiKey = config["OPENAI_API_KEY"];
         if (string.IsNullOrWhiteSpace(apiKey))
             throw new InvalidOperationException("Required setting OPENAI_API_KEY is missing.");
@@ -313,9 +330,11 @@ Return only JSON with this shape:
                         properties = new
                         {
                             text = new { type = "string" },
-                            transferToHuman = new { type = "boolean" }
+                            transferToHuman = new { type = "boolean" },
+                            offerClosing = new { type = "boolean" },
+                            endCall = new { type = "boolean" }
                         },
-                        required = new[] { "text", "transferToHuman" },
+                        required = new[] { "text", "transferToHuman", "offerClosing", "endCall" },
                         additionalProperties = false
                     }
                 }
@@ -346,10 +365,14 @@ Return only JSON with this shape:
         if (string.IsNullOrWhiteSpace(outputText))
             throw new InvalidOperationException("OpenAI returned no output text.");
 
-        return JsonSerializer.Deserialize<AgentAnswer>(
+        var answer = JsonSerializer.Deserialize<AgentAnswer>(
                    outputText,
                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                ?? throw new InvalidOperationException("OpenAI returned an invalid response.");
+        if (answer.TransferToHuman) return ClosingRules.Transfer;
+        if (answer.EndCall) return closingPending ? ClosingRules.Farewell : ClosingRules.Offer;
+        if (answer.OfferClosing || ClosingRules.IsGoodbye(answer.Text)) return ClosingRules.Offer;
+        return answer;
     }
 }
 
@@ -363,7 +386,47 @@ public static class TransferRules
     ];
 
     public static bool RequestsHuman(string text) =>
+        !ClosingRules.IsNegative(text) &&
         HumanPhrases.Any(p => text.Contains(p, StringComparison.OrdinalIgnoreCase));
+}
+
+public static class ClosingRules
+{
+    public const string OfferText =
+        "Before we end our call, would you like me to connect you with an MIS representative?";
+    public static readonly AgentAnswer Offer = new(OfferText, false, true);
+    public static readonly AgentAnswer Transfer = new(
+        "Certainly. I will connect you with someone at Micro Integration Services now.", true);
+    public static readonly AgentAnswer Farewell = new(
+        "Thank you for calling Micro Integration Services. We appreciate your interest and look forward to helping you. Have a wonderful day!", false, false, true);
+
+    public static bool IsPending(IReadOnlyList<ConversationMessage> history) =>
+        history.Count >= 2 && history[^2].Role == "assistant" && history[^2].Text == OfferText;
+
+    private static string Normalize(string text) =>
+        text.Trim().TrimEnd('.', '!', '?', ',').ToLowerInvariant().Replace("’", "'");
+
+    public static bool IsDecline(string text) => Normalize(text) is
+        "no" or "no thanks" or "no thank you" or "no, thanks" or "no, thank you" or
+        "nothing else" or "that's all" or "goodbye" or "bye" or "i'm all set";
+
+    public static bool IsNegative(string text) =>
+        IsDecline(text) || Normalize(text).StartsWith("no,") ||
+        Normalize(text).Contains("don't need") || Normalize(text).Contains("don't want") ||
+        Normalize(text).Contains("do not want");
+
+    public static bool IsAcceptance(string text) => Normalize(text) is
+        "yes" or "yes please" or "yes, please" or "sure" or "connect me" or "transfer me" ||
+        TransferRules.RequestsHuman(text);
+
+    public static bool IsGoodbye(string text)
+    {
+        var normalized = Normalize(text);
+        return normalized is "bye" or "goodbye" or "that's all" or "i'm all set" or
+            "have a nice day" or "have a wonderful day" ||
+            normalized.EndsWith(" goodbye") || normalized.EndsWith(" have a wonderful day") ||
+            normalized.EndsWith(" have a nice day");
+    }
 }
 
 public sealed class LeadStore
@@ -389,7 +452,9 @@ public sealed record ConversationMessage(
 
 public sealed record AgentAnswer(
     [property: JsonPropertyName("text")] string Text,
-    [property: JsonPropertyName("transferToHuman")] bool TransferToHuman);
+    [property: JsonPropertyName("transferToHuman")] bool TransferToHuman,
+    [property: JsonPropertyName("offerClosing")] bool OfferClosing = false,
+    [property: JsonPropertyName("endCall")] bool EndCall = false);
 
 public sealed record QualifiedLead(
     string CallSid,
@@ -451,7 +516,7 @@ document.querySelector('form').onsubmit=async e=>{
  messages.push({role:'caller',text});log.textContent+='\n\nCaller: '+text;
  const r=await fetch('/test/conversation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({messages})});
  const a=await r.json();messages.push({role:'assistant',text:a.text});
- log.textContent+='\n\nAssistant: '+a.text+(a.transferToHuman?'\n[TRANSFER TO HUMAN]':'');window.scrollTo(0,document.body.scrollHeight);
+ log.textContent+='\n\nAssistant: '+a.text+(a.transferToHuman?'\n[TRANSFER TO HUMAN]':a.endCall?'\n[CALL ENDED]':'');if(a.transferToHuman||a.endCall){input.disabled=true;document.querySelector("button").disabled=true;}window.scrollTo(0,document.body.scrollHeight);
 };
 </script>
 </body>

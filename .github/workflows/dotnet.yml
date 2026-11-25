@@ -16,3 +16,4 @@ jobs:
           dotnet-version: 9.0.x
       - run: dotnet restore src/MisAIPhoneAttendant/MisAIPhoneAttendant.csproj
       - run: dotnet build src/MisAIPhoneAttendant/MisAIPhoneAttendant.csproj --configuration Release --no-restore
+      - run: dotnet run --project tests/ClosingRules.Tests/ClosingRules.Tests.csproj --configuration Release
